@@ -13,13 +13,15 @@ from pathlib import Path
 
 import pandas as pd
 
-from pipeline.ingest.schedule      import fetch_schedule
-from pipeline.ingest.statcast      import fetch_and_cache_statcast
+from pipeline.ingest.schedule         import fetch_schedule
+from pipeline.ingest.statcast         import fetch_and_cache_statcast
+from pipeline.ingest.odds             import fetch_odds_today, match_odds_to_schedule
+from pipeline.ingest.team_map         import team_id_to_name
 from pipeline.features.feature_matrix import build_game_feature_vector
-from pipeline.features.context     import load_park_factors
-from pipeline.models.gradient_boost import load_model, predict
-from pipeline.risk.kelly           import size_slate
-from pipeline.risk.drawdown        import check_drawdown_protection
+from pipeline.features.context        import load_park_factors
+from pipeline.models.gradient_boost   import load_model, predict
+from pipeline.risk.kelly              import size_slate
+from pipeline.risk.drawdown           import check_drawdown_protection
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,19 +30,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-STATCAST_LOOKBACK_DAYS = 90     # rolling window fed to feature builders
+STATCAST_LOOKBACK_DAYS = 90
 BANKROLL_PATH          = Path("data/bankroll.json")
 MODEL_TAG              = "latest"
 OUTPUT_DIR             = Path("data/outputs")
 
-
-# ---------------------------------------------------------------------------
-# Bankroll state
-# ---------------------------------------------------------------------------
 
 def _load_bankroll() -> dict:
     import json
@@ -59,38 +53,39 @@ def _save_bankroll(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline steps
-# ---------------------------------------------------------------------------
-
 def _load_statcast(as_of_date: date) -> pd.DataFrame:
     start = as_of_date - timedelta(days=STATCAST_LOOKBACK_DAYS)
-    end   = as_of_date - timedelta(days=1)   # never fetch today
+    end   = as_of_date - timedelta(days=1)
     log.info(f"Loading Statcast {start} → {end}")
     df = fetch_and_cache_statcast(start, end)
-    # Enforce date type consistency
     df["game_date"] = pd.to_datetime(df["game_date"]).dt.strftime("%Y-%m-%d")
-    # Critical: strip anything on or after as_of_date
     df = df[df["game_date"] < as_of_date.isoformat()].copy()
     log.info(f"Statcast rows loaded: {len(df):,}")
     return df
 
 
+def _enrich_games_with_names(games: list[dict]) -> list[dict]:
+    """Attach human-readable team names for odds matching."""
+    for g in games:
+        g["home_team_name"] = team_id_to_name(g["home_team_id"])
+        g["away_team_name"] = team_id_to_name(g["away_team_id"])
+    return games
+
+
 def _build_features(
-    games:       list[dict],
-    as_of_date:  date,
-    statcast_df: pd.DataFrame,
+    games:        list[dict],
+    as_of_date:   date,
+    statcast_df:  pd.DataFrame,
     park_factors: dict,
 ) -> pd.DataFrame:
-    rows = []
-    skipped = 0
+    rows, skipped = [], 0
     for game in games:
         row = build_game_feature_vector(game, as_of_date, statcast_df, park_factors)
         if row is None:
             skipped += 1
             continue
         rows.append(row)
-    log.info(f"Features built: {len(rows)} games | skipped (no SP): {skipped}")
+    log.info(f"Features built: {len(rows)} | skipped (no SP): {skipped}")
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
@@ -106,16 +101,10 @@ def _run_predictions(feature_df: pd.DataFrame) -> pd.DataFrame:
     return feature_df
 
 
-def _fetch_odds(games: list[dict]) -> dict[int, dict]:
-    """
-    Placeholder: returns neutral odds for all games.
-    Replace with live odds feed (Pinnacle, DraftKings API, etc.).
-    Format: {game_pk: {"odds_home": int, "odds_away": int}}
-    """
-    return {g["game_pk"]: {"odds_home": -110, "odds_away": -110} for g in games}
-
-
-def _build_slate(pred_df: pd.DataFrame, odds: dict[int, dict]) -> list[dict]:
+def _build_slate(
+    pred_df: pd.DataFrame,
+    odds:    dict[int, dict],
+) -> list[dict]:
     slate = []
     for _, row in pred_df.iterrows():
         pk = int(row["game_pk"])
@@ -137,31 +126,23 @@ def _save_output(pred_df: pd.DataFrame, bets: list, run_date: date) -> None:
 
     pred_path = OUTPUT_DIR / f"predictions_{tag}.csv"
     pred_df.to_csv(pred_path, index=False)
-    log.info(f"Predictions saved → {pred_path}")
+    log.info(f"Predictions → {pred_path}")
 
     bets_path = OUTPUT_DIR / f"bets_{tag}.json"
     with open(bets_path, "w") as f:
-        json.dump(
-            [b.__dict__ for b in bets],
-            f, indent=2, default=str,
-        )
-    log.info(f"Bets saved → {bets_path}  ({len(bets)} bets)")
+        json.dump([b.__dict__ for b in bets], f, indent=2, default=str)
+    log.info(f"Bets → {bets_path}  ({len(bets)} bets)")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def run(target_date: date) -> None:
     log.info(f"=== Daily pipeline | {target_date} ===")
 
-    # ── Drawdown check ───────────────────────────────────────────────────────
     bankroll_state = _load_bankroll()
     if check_drawdown_protection(
-        bankroll_history  = bankroll_state["history"],
-        current_bankroll  = bankroll_state["current"],
-        peak_bankroll     = bankroll_state["peak"],
-        halt_threshold    = 0.10,
+        bankroll_history = bankroll_state["history"],
+        current_bankroll = bankroll_state["current"],
+        peak_bankroll    = bankroll_state["peak"],
+        halt_threshold   = 0.10,
     ):
         log.warning(
             f"DRAWDOWN HALT — current: {bankroll_state['current']:.2f} | "
@@ -169,30 +150,29 @@ def run(target_date: date) -> None:
         )
         return
 
-    # ── Ingest ───────────────────────────────────────────────────────────────
     games = fetch_schedule(target_date)
     if not games:
-        log.info("No games scheduled. Exiting.")
+        log.info("No games scheduled.")
         return
     log.info(f"Games on slate: {len(games)}")
 
+    games        = _enrich_games_with_names(games)
     statcast_df  = _load_statcast(target_date)
     park_factors = load_park_factors()
 
-    # ── Features ─────────────────────────────────────────────────────────────
     feature_df = _build_features(games, target_date, statcast_df, park_factors)
     if feature_df.empty:
-        log.info("No feature rows built. Exiting.")
+        log.info("No feature rows built.")
         return
 
-    # ── Model ────────────────────────────────────────────────────────────────
     pred_df = _run_predictions(feature_df)
     if pred_df.empty:
-        log.info("No predictions. Exiting.")
+        log.info("No predictions.")
         return
 
-    # ── Bet sizing ───────────────────────────────────────────────────────────
-    odds  = _fetch_odds(games)
+    odds_map = fetch_odds_today(target_date)
+    odds     = match_odds_to_schedule(games, odds_map)
+
     slate = _build_slate(pred_df, odds)
     bets  = size_slate(
         predictions      = slate,
@@ -203,7 +183,6 @@ def run(target_date: date) -> None:
         max_exposure     = 0.20,
     )
 
-    # ── Output ───────────────────────────────────────────────────────────────
     _save_output(pred_df, bets, target_date)
 
     total_risk = sum(b.bet_units for b in bets)
@@ -220,7 +199,6 @@ if __name__ == "__main__":
         "--date",
         type=lambda s: date.fromisoformat(s),
         default=date.today(),
-        help="Target date (YYYY-MM-DD). Defaults to today.",
     )
     args = parser.parse_args()
     run(args.date)
