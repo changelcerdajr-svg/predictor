@@ -84,6 +84,7 @@ class WalkForwardEngine:
         self.model            = None
         self.scaler           = None
         self.ledger_rows: list[dict] = []
+        self._cur_date = start
 
     # ------------------------------------------------------------------
     def _stub_odds(self, games: list[dict]) -> dict[int, dict]:
