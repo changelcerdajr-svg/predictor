@@ -40,20 +40,15 @@ def normalize_team_name(name: str) -> str:
     return _ALIASES.get(key, key)
 
 
-# Stats API team_id → canonical short name
-TEAM_ID_TO_NAME: dict[int, str] = {
-    109: "diamondbacks", 144: "braves",    110: "orioles",
-    111: "red sox",      112: "cubs",      145: "white sox",
-    113: "reds",         114: "guardians", 115: "rockies",
-    116: "tigers",       117: "astros",    118: "royals",
-    108: "angels",       119: "dodgers",   146: "marlins",
-    158: "brewers",      142: "twins",     121: "mets",
-    147: "yankees",      133: "athletics", 143: "phillies",
-    134: "pirates",      135: "padres",    137: "giants",
-    136: "mariners",     138: "cardinals", 139: "rays",
-    140: "rangers",      141: "blue jays", 120: "nationals",
+TEAM_ID_TO_ABR: dict[int, str] = {
+    108: "LAA", 109: "ARI", 110: "BAL", 111: "BOS", 112: "CHC",
+    113: "CIN", 114: "CLE", 115: "COL", 116: "DET", 117: "HOU",
+    118: "KC",  119: "LAD", 120: "WSH", 121: "NYM", 133: "OAK",
+    134: "PIT", 135: "SD",  136: "SEA", 137: "SF",  138: "STL",
+    139: "TB",  140: "TEX", 141: "TOR", 142: "MIN", 143: "PHI",
+    144: "ATL", 145: "CWS", 146: "MIA", 147: "NYY", 158: "MIL",
 }
-
-
-def team_id_to_name(team_id: int) -> str:
-    return TEAM_ID_TO_NAME.get(team_id, str(team_id))
+ 
+def team_abr(team_id: int) -> str | None:
+    """Returns Statcast abbreviation for a given MLB Stats API team_id."""
+    return TEAM_ID_TO_ABR.get(team_id)
