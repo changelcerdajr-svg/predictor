@@ -11,17 +11,11 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
-from pipeline.ingest.schedule         import fetch_schedule
-from pipeline.ingest.statcast         import fetch_and_cache_statcast
-from pipeline.features.feature_matrix import build_game_feature_vector
-from pipeline.features.context        import load_park_factors
-from pipeline.models.gradient_boost   import train, predict, FEATURE_COLS
-from pipeline.calibration.temperature_scaling import TemperatureScaler
-from pipeline.risk.kelly              import size_slate
-from pipeline.backtest.evaluator      import evaluate
+from pipeline.backtest.engine         import WalkForwardEngine
+from pipeline.backtest.evaluator      import evaluate, calibration_report, edge_decay_report
+from pipeline.ingest.results          import fetch_outcomes_for_date
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,255 +24,103 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-OUTPUT_DIR           = Path("data/backtest")
-STATCAST_LOOKBACK    = 90    # days of history fed to feature builders
-TRAIN_MINIMUM_DAYS   = 365   # don't start predicting until 1 full season exists
-RETRAIN_EVERY_DAYS   = 30    # re-train model monthly
+OUTPUT_DIR = Path("data/backtest")
 
 
-# ---------------------------------------------------------------------------
-# Data loading helpers
-# ---------------------------------------------------------------------------
-
-def _load_statcast_window(
-    as_of_date: date,
-    lookback_days: int = STATCAST_LOOKBACK,
-) -> pd.DataFrame:
-    start = as_of_date - timedelta(days=lookback_days)
-    end   = as_of_date - timedelta(days=1)
-    df    = fetch_and_cache_statcast(start, end)
-    df["game_date"] = pd.to_datetime(df["game_date"]).dt.strftime("%Y-%m-%d")
-    return df[df["game_date"] < as_of_date.isoformat()].copy()
-
-
-def _build_feature_row(
-    game:        dict,
-    as_of_date:  date,
-    statcast_df: pd.DataFrame,
-    park_factors: dict,
-) -> dict | None:
-    return build_game_feature_vector(game, as_of_date, statcast_df, park_factors)
-
-
-# ---------------------------------------------------------------------------
-# Training data accumulation
-# ---------------------------------------------------------------------------
-
-def _fetch_outcomes(game_pks: list[int]) -> dict[int, int]:
+def _patch_engine_outcomes(engine: WalkForwardEngine) -> None:
     """
-    Placeholder: fetch actual home_win (1/0) for completed games.
-    Replace with Stats API or local results DB.
-    Format: {game_pk: 1|0}
+    Monkey-patch the engine's internal _fetch_outcomes to use
+    the real results ingest instead of the stub.
     """
-    # TODO: wire to pipeline/ingest/results.py
-    return {}
+    from pipeline.ingest.results import fetch_outcomes_for_date
+
+    def _real_outcomes(game_pks: list[int]) -> dict[int, int]:
+        # engine sets self._cur_date before calling _fetch_outcomes
+        all_outcomes = fetch_outcomes_for_date(engine._cur_date)
+        return {pk: all_outcomes[pk] for pk in game_pks if pk in all_outcomes}
+
+    import pipeline.backtest.engine as eng_mod
+    eng_mod._fetch_outcomes = _real_outcomes
 
 
-def _accumulate_training_data(
-    start:       date,
-    end:         date,
-    park_factors: dict,
-) -> pd.DataFrame:
-    """
-    Build labelled feature rows for every game in [start, end].
-    Iterates day-by-day; skips games with missing outcomes.
-    """
-    rows     = []
-    cur_date = start
+def _save_reports(
+    ledger:          pd.DataFrame,
+    start:           date,
+    end:             date,
+    initial_bankroll: float,
+) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    tag = f"{start}_{end}"
 
-    while cur_date <= end:
-        games = fetch_schedule(cur_date)
-        if games:
-            statcast_df = _load_statcast_window(cur_date)
-            outcomes    = _fetch_outcomes([g["game_pk"] for g in games])
+    ledger_path = OUTPUT_DIR / f"backtest_{tag}.csv"
+    ledger.to_csv(ledger_path, index=False)
+    log.info(f"Ledger → {ledger_path}")
 
-            for game in games:
-                pk  = game["game_pk"]
-                row = _build_feature_row(game, cur_date, statcast_df, park_factors)
-                if row is None or pk not in outcomes:
-                    continue
-                row["home_win"]  = outcomes[pk]
-                row["game_date"] = cur_date.isoformat()
-                rows.append(row)
+    cal = calibration_report(ledger)
+    cal.to_csv(OUTPUT_DIR / f"calibration_{tag}.csv", index=False)
 
-        cur_date += timedelta(days=1)
+    decay = edge_decay_report(ledger)
+    decay.to_csv(OUTPUT_DIR / f"edge_decay_{tag}.csv", index=False)
 
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+    summary = evaluate(ledger, initial_bankroll)
+    log.info("\n=== BACKTEST SUMMARY ===")
+    for k, v in summary.items():
+        log.info(f"  {k:<30} {v}")
 
-
-# ---------------------------------------------------------------------------
-# Walk-forward engine
-# ---------------------------------------------------------------------------
-
-def _stub_odds(games: list[dict]) -> dict[int, dict]:
-    """Neutral -110 both sides until live odds feed is wired."""
-    return {g["game_pk"]: {"odds_home": -110, "odds_away": -110} for g in games}
+    import json
+    with open(OUTPUT_DIR / f"summary_{tag}.json", "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    log.info(f"Summary → {OUTPUT_DIR / f'summary_{tag}.json'}")
 
 
 def run_backtest(
-    start:           date,
-    end:             date,
+    start:            date,
+    end:              date,
     kelly_multiplier: float = 0.25,
-    min_edge:        float  = 0.03,
-    max_fraction:    float  = 0.05,
-    max_exposure:    float  = 0.20,
+    min_edge:         float = 0.03,
+    max_fraction:     float = 0.05,
+    max_exposure:     float = 0.20,
     initial_bankroll: float = 1000.0,
+    train_min_days:   int   = 365,
+    retrain_every:    int   = 30,
+    drawdown_halt:    float = 0.10,
 ) -> pd.DataFrame:
-    """
-    Walk-forward backtest:
-      1. Accumulate training data up to train_end
-      2. Train model
-      3. Predict and size bets one day at a time
-      4. Re-train every RETRAIN_EVERY_DAYS days
-      5. Return daily P&L ledger
-    """
-    park_factors = load_park_factors()
 
-    # ── Phase 1: accumulate initial training set ─────────────────────────────
-    train_end  = start + timedelta(days=TRAIN_MINIMUM_DAYS)
-    if train_end >= end:
-        log.error("Backtest window too short for minimum training period.")
-        return pd.DataFrame()
+    engine = WalkForwardEngine(
+        start            = start,
+        end              = end,
+        initial_bankroll = initial_bankroll,
+        kelly_multiplier = kelly_multiplier,
+        min_edge         = min_edge,
+        max_fraction     = max_fraction,
+        max_exposure     = max_exposure,
+        train_min_days   = train_min_days,
+        retrain_every    = retrain_every,
+        drawdown_halt    = drawdown_halt,
+    )
 
-    log.info(f"Accumulating training data {start} → {train_end}")
-    train_df = _accumulate_training_data(start, train_end, park_factors)
+    _patch_engine_outcomes(engine)
 
-    if train_df.empty:
-        log.error("No training data accumulated. Aborting.")
-        return pd.DataFrame()
+    ledger = engine.run()
 
-    # ── Phase 2: walk-forward ────────────────────────────────────────────────
-    model, scaler, metrics = train(train_df)
-    log.info(f"Initial model trained | AUC={metrics['oof_auc']:.4f} | "
-             f"Brier={metrics['oof_brier_cal']:.4f} | T={metrics['temperature_T']:.3f}")
+    if ledger.empty:
+        log.warning("Empty ledger — no settled bets recorded.")
+        return ledger
 
-    bankroll       = initial_bankroll
-    peak_bankroll  = initial_bankroll
-    last_retrain   = train_end
-    ledger_rows    = []
-    cur_date       = train_end + timedelta(days=1)
-
-    while cur_date <= end:
-        # ── Periodic re-train ────────────────────────────────────────────────
-        if (cur_date - last_retrain).days >= RETRAIN_EVERY_DAYS:
-            new_train_df = _accumulate_training_data(start, cur_date, park_factors)
-            if not new_train_df.empty:
-                model, scaler, metrics = train(new_train_df)
-                last_retrain = cur_date
-                log.info(f"Re-trained {cur_date} | AUC={metrics['oof_auc']:.4f}")
-
-        # ── Daily prediction + sizing ─────────────────────────────────────────
-        games = fetch_schedule(cur_date)
-        if not games:
-            cur_date += timedelta(days=1)
-            continue
-
-        statcast_df  = _load_statcast_window(cur_date)
-        feature_rows = []
-        game_map     = {}
-
-        for game in games:
-            row = _build_feature_row(game, cur_date, statcast_df, park_factors)
-            if row is None:
-                continue
-            feature_rows.append(row)
-            game_map[game["game_pk"]] = game
-
-        if not feature_rows:
-            cur_date += timedelta(days=1)
-            continue
-
-        feat_df = pd.DataFrame(feature_rows)
-        probs   = predict(feat_df, model, scaler)
-        feat_df["prob_home"] = probs
-        feat_df = feat_df.dropna(subset=["prob_home"])
-
-        odds  = _stub_odds(games)
-        slate = [
-            {
-                "game_pk":   int(row["game_pk"]),
-                "prob_home": float(row["prob_home"]),
-                "odds_home": odds[int(row["game_pk"])]["odds_home"],
-                "odds_away": odds[int(row["game_pk"])]["odds_away"],
-            }
-            for _, row in feat_df.iterrows()
-            if int(row["game_pk"]) in odds
-        ]
-
-        bets = size_slate(
-            predictions      = slate,
-            bankroll         = bankroll,
-            kelly_multiplier = kelly_multiplier,
-            min_edge         = min_edge,
-            max_fraction     = max_fraction,
-            max_exposure     = max_exposure,
-        )
-
-        # ── Settle bets ───────────────────────────────────────────────────────
-        outcomes = _fetch_outcomes([g["game_pk"] for g in games])
-        day_pnl  = 0.0
-
-        for bet in bets:
-            outcome = outcomes.get(bet.game_pk)
-            if outcome is None:
-                continue   # game not settled yet
-            home_won = bool(outcome)
-            won      = (bet.side == "home" and home_won) or \
-                       (bet.side == "away" and not home_won)
-            pnl      = bet.bet_units * (bet.decimal_odds - 1.0) if won \
-                       else -bet.bet_units
-            day_pnl += pnl
-
-            ledger_rows.append({
-                "date":          cur_date.isoformat(),
-                "game_pk":       bet.game_pk,
-                "side":          bet.side,
-                "prob":          bet.prob,
-                "edge":          bet.edge,
-                "odds":          bet.american_odds,
-                "bet_units":     bet.bet_units,
-                "won":           int(won),
-                "pnl":           pnl,
-                "bankroll_pre":  bankroll,
-            })
-
-        bankroll      += day_pnl
-        peak_bankroll  = max(peak_bankroll, bankroll)
-
-        log.info(
-            f"{cur_date} | bets={len(bets)} | "
-            f"day_pnl=${day_pnl:+.2f} | bankroll=${bankroll:.2f}"
-        )
-
-        cur_date += timedelta(days=1)
-
-    # ── Save ledger ───────────────────────────────────────────────────────────
-    ledger = pd.DataFrame(ledger_rows)
-    if not ledger.empty:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        path = OUTPUT_DIR / f"backtest_{start}_{end}.csv"
-        ledger.to_csv(path, index=False)
-        log.info(f"Ledger saved → {path}")
-
-        summary = evaluate(ledger, initial_bankroll)
-        log.info("\n=== BACKTEST SUMMARY ===")
-        for k, v in summary.items():
-            log.info(f"  {k:<28} {v}")
-
+    _save_reports(ledger, start, end, initial_bankroll)
     return ledger
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--start",    type=lambda s: date.fromisoformat(s), required=True)
-    parser.add_argument("--end",      type=lambda s: date.fromisoformat(s), required=True)
-    parser.add_argument("--min-edge", type=float, default=0.03)
-    parser.add_argument("--kelly",    type=float, default=0.25)
-    parser.add_argument("--bankroll", type=float, default=1000.0)
+    parser.add_argument("--start",        type=lambda s: date.fromisoformat(s), required=True)
+    parser.add_argument("--end",          type=lambda s: date.fromisoformat(s), required=True)
+    parser.add_argument("--min-edge",     type=float, default=0.03)
+    parser.add_argument("--kelly",        type=float, default=0.25)
+    parser.add_argument("--bankroll",     type=float, default=1000.0)
+    parser.add_argument("--train-days",   type=int,   default=365)
+    parser.add_argument("--retrain-days", type=int,   default=30)
+    parser.add_argument("--drawdown",     type=float, default=0.10)
     args = parser.parse_args()
 
     run_backtest(
@@ -287,4 +129,7 @@ if __name__ == "__main__":
         min_edge         = args.min_edge,
         kelly_multiplier = args.kelly,
         initial_bankroll = args.bankroll,
+        train_min_days   = args.train_days,
+        retrain_every    = args.retrain_days,
+        drawdown_halt    = args.drawdown,
     )
