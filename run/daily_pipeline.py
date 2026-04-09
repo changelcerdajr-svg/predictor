@@ -20,6 +20,7 @@ from pipeline.features.context        import load_park_factors
 from pipeline.models.gradient_boost   import load_model, predict
 from pipeline.risk.kelly              import size_slate
 from pipeline.risk.drawdown           import check_drawdown_protection
+from pipeline.ingest.odds import fetch_odds
  
 logging.basicConfig(
     level=logging.INFO,
@@ -92,15 +93,6 @@ def _run_predictions(feature_df: pd.DataFrame) -> pd.DataFrame:
     return feature_df
  
  
-def _fetch_odds(games: list[dict]) -> dict[int, dict]:
-    """
-    Placeholder: replace with live odds feed (Pinnacle, DraftKings API, etc.).
-    WARNING: currently returns neutral -110/-110 for all games.
-    """
-    log.warning("_fetch_odds() is using placeholder odds (-110/-110). Wire a real feed before betting.")
-    return {g["game_pk"]: {"odds_home": -110, "odds_away": -110} for g in games}
- 
- 
 def _build_slate(pred_df: pd.DataFrame, odds: dict[int, dict]) -> list[dict]:
     slate = []
     for _, row in pred_df.iterrows():
@@ -167,7 +159,7 @@ def run(target_date: date) -> None:
         log.info("No predictions. Exiting.")
         return
  
-    odds  = _fetch_odds(games)
+    odds = fetch_odds(games, target_date)
     slate = _build_slate(pred_df, odds)
     bets  = size_slate(
         predictions      = slate,

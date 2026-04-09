@@ -16,7 +16,7 @@ def fetch_schedule(game_date: date) -> list[dict]:
         "date": game_date.strftime("%Y-%m-%d"),
         "hydrate": "probablePitcher,venue,weather,broadcasts"
     }
-    resp = requests.get(MLB_SCHEDULE_URL, params=params, timeout=10)
+    resp = requests.get(MLB_SCHEDULE_URL, params=params, timeout=60)
     resp.raise_for_status()
     data = resp.json()
     

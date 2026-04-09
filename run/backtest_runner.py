@@ -21,7 +21,8 @@ from pipeline.features.context        import load_park_factors
 from pipeline.models.gradient_boost   import train, predict, FEATURE_COLS
 from pipeline.risk.kelly              import size_slate
 from pipeline.backtest.evaluator      import evaluate
- 
+from pipeline.ingest.odds import fetch_odds
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -119,9 +120,6 @@ def _accumulate_training_data(
 # Walk-forward engine
 # ---------------------------------------------------------------------------
  
-def _stub_odds(games: list[dict]) -> dict[int, dict]:
-    return {g["game_pk"]: {"odds_home": -110, "odds_away": -110} for g in games}
- 
  
 def run_backtest(
     start:            date,
@@ -195,7 +193,7 @@ def run_backtest(
         feat_df["prob_home"] = probs
         feat_df = feat_df.dropna(subset=["prob_home"])
  
-        odds  = _stub_odds(games)
+        odds = fetch_odds(games, cur_date)
         slate = [
             {
                 "game_pk":   int(row["game_pk"]),
